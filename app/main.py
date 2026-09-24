@@ -99,6 +99,18 @@
   且 windows 表中没有该位置的窗口记录。
 - 按现存窗口之间的空隙计算（空隙宽度 / 窗口大小 = 缺失窗口数），不逐窗遍历跨度；
   迟到事件首次填入空窗后新增窗口记录，后续查询自动缩短或拆分缺报段，不追改已有聚合。
+- exclude_planned=true 时先按上述口径求出原始缺报段，再把查询范围内与之重叠的
+  计划停报区间合并后整体扣除（重叠只扣一次，端点相接不算重叠），剩余连续段照常返回。
+
+设备计划停报登记（区分已批准停机与异常缺报）：
+- POST /devices/{device_id}/planned-outages 按设备登记计划停报时段，半开 [start, end)，
+  start/end 必须按该设备窗口大小对齐且 end > start，否则 422；设备不存在 404。
+- 允许登记互相重叠的时段（多次停机审批各自留痕）；GET 缺报查询扣除前先做区间合并，
+  重叠部分不会重复扣除。
+- GET /devices/{device_id}/planned-outages 列出该设备的计划停报时段，可选用 start/end
+  过滤"与 [start,end) 相交"的登记（end<=start 为 422），按开始时间、登记 id 升序。
+- 区间运算全部基于段级算术（合并 + 扣除），复杂度只与缺报段数和登记段数成正比，
+  绝不逐窗遍历；半开语义下端点触碰（[a,b) 与 [b,c)）不算重叠、互不影响。
 
 设备每日同窗基线偏移查询（只读）：
 - GET /devices/{device_id}/daily-baseline?window_start=&days=&threshold= 以目标窗口为基准，
@@ -156,7 +168,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.10.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.11.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -291,6 +303,23 @@ class MissingWindowSegmentOut(BaseModel):
     start: datetime
     end: datetime
     missing_windows: int
+
+
+class PlannedOutageIn(BaseModel):
+    # 登记区间为半开 [start, end)；起止必须按设备窗口大小对齐且 end > start（接口层校验）
+    start: datetime
+    end: datetime
+    # 可选登记备注；不超过 500 字符，去首尾空白后为空则按 null 存储
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class PlannedOutageOut(BaseModel):
+    id: int
+    device_id: str
+    start: datetime
+    end: datetime
+    reason: Optional[str] = None
+    created_at: datetime
 
 
 class AnomalyOut(BaseModel):
@@ -1470,11 +1499,84 @@ def list_corrections(device_id: str) -> list[CorrectionOut]:
 
 # ---------- 设备缺报区间查询接口 ----------
 
+def _merge_overlapping(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """把有序半开区间合并重叠（含包含）者。
+
+    仅合并**严格重叠**（a_end > b_start）的区间；端点触碰（a_end == b_start）不算重叠、
+    保持为两段。合并先行保证后续扣除时重叠的计划停报不会重复扣减。
+    """
+    merged: list[list[float]] = []
+    for lo, hi in sorted(intervals):
+        if merged and lo < merged[-1][1]:
+            if hi > merged[-1][1]:
+                merged[-1][1] = hi
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+def _subtract_intervals(
+    segments: list[tuple[float, float]], cuts: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """从有序、互不相交的半开段集合 segments 中扣除同样有序不相交的 cuts 并集。
+
+    双指针按段级算术推进，复杂度 O(len(segments) + len(cuts))——与区间跨度包含多少个
+    窗口无关，绝不逐窗遍历。半开语义：cut 端点与段端点触碰（相等）时不产生任何裁剪。
+    """
+    result: list[tuple[float, float]] = []
+    i = j = 0
+    while i < len(segments) and j < len(cuts):
+        s_lo, s_hi = segments[i]
+        c_lo, c_hi = cuts[j]
+        if c_hi <= s_lo:
+            # cut 整体在段左侧（含端点相接：c_hi == s_lo 不裁剪）
+            j += 1
+        elif c_lo >= s_hi:
+            # cut 整体在段右侧（含端点相接：c_lo == s_hi 不裁剪）
+            result.append((s_lo, s_hi))
+            i += 1
+        else:
+            # 严格重叠：去掉 [max(s_lo,c_lo), min(s_hi,c_hi))，保留两侧残余
+            if c_lo > s_lo:
+                result.append((s_lo, c_lo))
+            if c_hi < s_hi:
+                segments[i] = (c_hi, s_hi)
+                j += 1
+            else:
+                # cut 延伸到段末或之外：该段处理完，右侧残余等下一轮 cut 再裁
+                i += 1
+    result.extend(segments[i:])
+    return result
+
+
+def _planned_outage_intervals(
+    conn: sqlite3.Connection, device_id: str, lo: float, hi: float
+) -> list[tuple[float, float]]:
+    """读取与半开查询范围 [lo, hi) 相交的计划停报区间（未合并、按起止有序）。
+
+    半开相交条件为 start_ts < hi AND end_ts > lo；端点触碰（end_ts == lo 或
+    start_ts == hi）的登记不入选。start_ts < hi 的索引范围扫描即可覆盖候选，
+    无需扫描设备的全部登记。
+    """
+    rows = conn.execute(
+        "SELECT start_ts, end_ts FROM device_planned_outages"
+        " WHERE device_id = ? AND start_ts < ? AND end_ts > ?"
+        " ORDER BY start_ts, end_ts, id",
+        (device_id, hi, lo),
+    ).fetchall()
+    return [(r["start_ts"], r["end_ts"]) for r in rows]
+
+
 @app.get("/devices/{device_id}/missing-windows", response_model=list[MissingWindowSegmentOut])
 def list_missing_windows(
     device_id: str,
     start: datetime = Query(..., description="统计范围下界（含），必须对齐设备窗口大小，ISO 8601"),
     end: datetime = Query(..., description="统计范围上界（不含），必须对齐设备窗口大小，ISO 8601"),
+    exclude_planned: bool = Query(
+        default=False,
+        description="为 true 时先按水位线/现存窗口/迟到补报规则求缺报，再扣除查询范围内"
+        "重叠的已登记计划停报时段（合并后扣除，重叠不重复扣减；端点触碰不算重叠）",
+    ),
 ) -> list[MissingWindowSegmentOut]:
     """查询设备在 [start, end) 内的连续缺报区间（只读）。
 
@@ -1489,6 +1591,11 @@ def list_missing_windows(
     后续查询自然按最新空隙缩短或拆分缺报段，不追改任何已有聚合。
     设备不存在返回 404；设备尚无数据返回空列表；
     end <= start 或边界未对齐设备窗口大小返回 422。
+
+    exclude_planned=true 时，先按上述水位线、现存窗口与迟到补报规则求出原始缺报段，
+    再把查询范围内与之重叠的计划停报登记取出、**合并重叠后整体扣除**
+    （同一时刻被多份登记覆盖也只扣一次；半开区间端点触碰不算重叠），返回剩余连续
+    缺报段及窗口数。合并与扣除均为段级区间运算，代价只与段数和登记数成正比。
     """
     with db.session() as conn:
         dev = require_device(conn, device_id)
@@ -1506,43 +1613,47 @@ def list_missing_windows(
                 detail=f"start and end must be aligned to the device window size ({size}s)",
             )
 
-        if watermark is None:
-            return []
-        first_start = conn.execute(
-            "SELECT MIN(window_start) AS first_start FROM windows WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()["first_start"]
-        if first_start is None:
-            return []
-
-        # 统计下界：最早有数据窗口的下一个窗口，且不早于 start
-        lo = max(start_ts, first_start + size)
-        # 满足封存条件的最大窗口起点（含）：watermark >= window_start + size + lateness
-        max_start = watermark - size - lateness
-        # 缺失位置的半开上界：对齐到窗口网格，且不超出 end
-        limit = min(end_ts, window_floor(max_start, size) + size)
-        if lo >= limit:
-            return []
-
-        # 只需 [lo, limit) 内的现存窗口记录，按空隙算术推出缺失段，不逐窗遍历跨度
-        starts = [
-            r["window_start"]
-            for r in conn.execute(
-                "SELECT window_start FROM windows"
-                " WHERE device_id = ? AND window_start >= ? AND window_start < ?"
-                " ORDER BY window_start",
-                (device_id, lo, limit),
-            ).fetchall()
-        ]
-
         gaps: list[tuple[float, float]] = []
-        cursor = lo
-        for w in starts:
-            if w > cursor:
-                gaps.append((cursor, w))
-            cursor = w + size
-        if cursor < limit:
-            gaps.append((cursor, limit))
+        if watermark is not None:
+            first_start = conn.execute(
+                "SELECT MIN(window_start) AS first_start FROM windows WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()["first_start"]
+            if first_start is not None:
+                # 统计下界：最早有数据窗口的下一个窗口，且不早于 start
+                lo = max(start_ts, first_start + size)
+                # 满足封存条件的最大窗口起点（含）：watermark >= window_start + size + lateness
+                max_start = watermark - size - lateness
+                # 缺失位置的半开上界：对齐到窗口网格，且不超出 end
+                limit = min(end_ts, window_floor(max_start, size) + size)
+                if lo < limit:
+                    # 只需 [lo, limit) 内的现存窗口记录，按空隙算术推出缺失段，不逐窗遍历跨度
+                    starts = [
+                        r["window_start"]
+                        for r in conn.execute(
+                            "SELECT window_start FROM windows"
+                            " WHERE device_id = ? AND window_start >= ? AND window_start < ?"
+                            " ORDER BY window_start",
+                            (device_id, lo, limit),
+                        ).fetchall()
+                    ]
+
+                    cursor = lo
+                    for w in starts:
+                        if w > cursor:
+                            gaps.append((cursor, w))
+                        cursor = w + size
+                    if cursor < limit:
+                        gaps.append((cursor, limit))
+
+                # 计划停报扣除：先合并查询范围内重叠的登记，再从原始缺报段中整体扣除。
+                # 扣除发生在已裁剪到 [start,end)、已按封存水位线截断的缺报段之上，
+                # 未封存窗口与设备开始上报之前的区间本来就不在 gaps 中，不会被误扣。
+                if exclude_planned and gaps:
+                    planned = _merge_overlapping(
+                        _planned_outage_intervals(conn, device_id, start_ts, end_ts)
+                    )
+                    gaps = _subtract_intervals(gaps, planned)
 
         return [
             MissingWindowSegmentOut(
@@ -1551,6 +1662,99 @@ def list_missing_windows(
                 missing_windows=int(round((gap_end - gap_start) / size)),
             )
             for gap_start, gap_end in gaps
+        ]
+
+
+# ---------- 设备计划停报登记接口 ----------
+
+@app.post(
+    "/devices/{device_id}/planned-outages",
+    response_model=PlannedOutageOut,
+    status_code=201,
+)
+def register_planned_outage(device_id: str, req: PlannedOutageIn) -> PlannedOutageOut:
+    """为设备登记一段计划停报（已批准停机），供缺报查询区分异常缺报。
+
+    登记区间为半开 `[start, end)`：`start`/`end` 必须**按该设备窗口大小对齐**
+    （如 60s 窗口必须落在整分钟）且 `end > start`，否则返回 `422`；设备不存在
+    返回 `404`。允许登记互相重叠或相接的时段——每次审批各自留痕，缺报查询扣除前
+    会先合并重叠区间，重叠部分不会被重复扣除，端点相接则互不影响。
+    """
+    start_ts = to_epoch(req.start)
+    end_ts = to_epoch(req.end)
+    reason = req.reason.strip() if req.reason is not None else None
+    if not reason:
+        reason = None
+
+    now = utcnow_iso()
+    with db.immediate_session() as conn:
+        dev = require_device(conn, device_id)
+        size = dev["window_size_seconds"]
+        if end_ts <= start_ts:
+            raise HTTPException(status_code=422, detail="end must be strictly greater than start")
+        if start_ts % size != 0 or end_ts % size != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start and end must be aligned to the device window size ({size}s)",
+            )
+
+        cur = conn.execute(
+            "INSERT INTO device_planned_outages (device_id, start_ts, end_ts, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (device_id, start_ts, end_ts, reason, now),
+        )
+        return PlannedOutageOut(
+            id=cur.lastrowid,
+            device_id=device_id,
+            start=to_iso(start_ts),
+            end=to_iso(end_ts),
+            reason=reason,
+            created_at=now,
+        )
+
+
+@app.get("/devices/{device_id}/planned-outages", response_model=list[PlannedOutageOut])
+def list_planned_outages(
+    device_id: str,
+    start: Optional[datetime] = Query(
+        default=None, description="可选：只返回与半开区间 [start, end) 相交的登记，ISO 8601"
+    ),
+    end: Optional[datetime] = Query(default=None, description="可选：过滤区间上界（不含），ISO 8601"),
+) -> list[PlannedOutageOut]:
+    """列出设备的计划停报时段，按开始时间、登记 id 升序。
+
+    不带 `start`/`end` 时返回全部登记；两者同时给出时只返回与半开区间 `[start, end)`
+    **相交**的登记（端点相接不算相交），`end <= start` 返回 `422`；只给其一时按
+    另一侧无界处理。设备不存在返回 `404`。
+    """
+    start_ts = to_epoch(start) if start is not None else None
+    end_ts = to_epoch(end) if end is not None else None
+    if start_ts is not None and end_ts is not None and end_ts <= start_ts:
+        raise HTTPException(status_code=422, detail="end must be strictly greater than start")
+
+    with db.session() as conn:
+        require_device(conn, device_id)
+        sql = "SELECT * FROM device_planned_outages WHERE device_id = ?"
+        params: list[Any] = [device_id]
+        # 半开相交：start_ts < end 且 end_ts > start；只给一侧时只施加对应约束
+        if end_ts is not None:
+            sql += " AND start_ts < ?"
+            params.append(end_ts)
+        if start_ts is not None:
+            sql += " AND end_ts > ?"
+            params.append(start_ts)
+        sql += " ORDER BY start_ts, id"
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            PlannedOutageOut(
+                id=r["id"],
+                device_id=r["device_id"],
+                start=to_iso(r["start_ts"]),
+                end=to_iso(r["end_ts"]),
+                reason=r["reason"],
+                created_at=r["created_at"],
+            )
+            for r in rows
         ]
 
 

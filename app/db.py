@@ -207,6 +207,24 @@ CREATE TABLE IF NOT EXISTS device_alert_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_alert_transitions_device
     ON device_alert_transitions (device_id, id);
+
+-- 设备计划停报登记（供运维区分已批准停机与异常缺报）：
+-- 半开区间 [start_ts, end_ts)，起止均按设备窗口大小对齐、end 严格大于 start（应用层校验）。
+-- 允许登记互相重叠的区间：缺报查询时先在应用层合并重叠再整体扣除，避免重复扣除；
+-- 端点相接（[a,b) 与 [b,c)）不算重叠。
+CREATE TABLE IF NOT EXISTS device_planned_outages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT NOT NULL,
+    start_ts   REAL NOT NULL,               -- 停报开始（epoch 秒，含），对齐设备窗口网格
+    end_ts     REAL NOT NULL,               -- 停报结束（epoch 秒，不含），对齐设备窗口网格
+    reason     TEXT,                        -- 可选登记备注（去首尾空白，空串记 NULL）
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+-- 缺报扣除只取与查询范围相交的登记：(device_id, start_ts, end_ts) 有序索引支持范围扫描
+CREATE INDEX IF NOT EXISTS idx_planned_outages_device_range
+    ON device_planned_outages (device_id, start_ts, end_ts);
 """
 
 

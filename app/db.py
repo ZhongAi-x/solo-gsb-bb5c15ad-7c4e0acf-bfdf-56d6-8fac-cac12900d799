@@ -207,6 +207,24 @@ CREATE TABLE IF NOT EXISTS device_alert_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_alert_transitions_device
     ON device_alert_transitions (device_id, id);
+
+-- 设备计划停报（已批准停机）时段：供运维区分"已批准停机"与"异常缺报"。
+-- 时段为半开区间 [start_time, end_time)，起止在应用层按设备窗口大小对齐，
+-- CHECK 兜底 end > start；允许重叠登记多条，查询缺报时先按严格重叠（端点触碰不算）
+-- 合并再扣除，重叠计划不会被重复扣除。与其他业务数据同库存放，随 /data 卷持久化。
+CREATE TABLE IF NOT EXISTS planned_outages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT NOT NULL,
+    start_time REAL NOT NULL,              -- epoch 秒，对齐设备窗口网格
+    end_time   REAL NOT NULL,              -- epoch 秒，对齐设备窗口网格，严格大于 start_time
+    reason     TEXT,                       -- 可选报备说明（去首尾空白；纯空白存 NULL）
+    created_at TEXT NOT NULL,
+    CHECK (end_time > start_time),
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_planned_outages_device_time
+    ON planned_outages (device_id, start_time, end_time);
 """
 
 
